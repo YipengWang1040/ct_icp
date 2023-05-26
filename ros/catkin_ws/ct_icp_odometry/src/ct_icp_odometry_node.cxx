@@ -4,6 +4,7 @@
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <nav_msgs/Odometry.h>
+#include <nav_msgs/Path.h>
 
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_eigen/tf2_eigen.h>
@@ -52,6 +53,8 @@ enum PUBLISHERS {
     ODOM_POSE,
     WORLD_POINTS,
     KEY_POINTS,
+    ODOM_TRAJ,
+    MAP,
 
     // Logging topics
     LOG_MONITOR
@@ -59,6 +62,8 @@ enum PUBLISHERS {
 std::map<PUBLISHERS, ros::Publisher> publishers;
 std::unique_ptr<tf2_ros::TransformBroadcaster> tfBroadcasterPtr;
 typedef pcl::PointCloud <slam::XYZTPoint> CloudMessageT;
+
+nav_msgs::Path odom_path;
 
 /* ------------------------------------------------------------------------------------------------------------------ */
 void RegisterNewFrameCallback(const sensor_msgs::PointCloud2Ptr &pc_ptr) {
@@ -74,7 +79,19 @@ void RegisterNewFrameCallback(const sensor_msgs::PointCloud2Ptr &pc_ptr) {
     // -- CHECK THAT THE TIMESTAMPS FIELD EXIST
     // TODO: Handle the case where there is no timestamps
 
+    auto copy = pointcloud->DeepCopyPtr();
+    {
+        auto field = copy->AddElementField<double, slam::FLOAT64>("timestamp");
+        copy->SetTimestampsField(std::move(field));
+    }
+    auto timestamps = copy->Timestamps<double>();
+    double size=pointcloud->size();
+    size_t idx=0;
+    for (auto &t: timestamps)
+        t = ((idx++)/size)/10;
+    pointcloud = copy;
     if (!pointcloud->HasTimestamps()) {
+        /*
         if (config.odometry_options.ct_icp_options.parametrization == ct_icp::CONTINUOUS_TIME) {
             ROS_INFO_STREAM("The point cloud does not have timestamps, this is incompatible "
                             "with the `CONTINUOUS_TIME` representation of pose in CT-ICP");
@@ -94,6 +111,7 @@ void RegisterNewFrameCallback(const sensor_msgs::PointCloud2Ptr &pc_ptr) {
         for (auto &t: timestamps)
             t = stamp_sec;
         pointcloud = copy;
+        */
 
     } else {
 
@@ -111,7 +129,7 @@ void RegisterNewFrameCallback(const sensor_msgs::PointCloud2Ptr &pc_ptr) {
 
 
         double dt = max_t - min_t;
-        double expected_dt;
+        double expected_dt=1;
         switch (config.unit) {
             case ct_icp::SECONDS:
                 expected_dt = config.expected_frame_time_sec;
@@ -123,6 +141,7 @@ void RegisterNewFrameCallback(const sensor_msgs::PointCloud2Ptr &pc_ptr) {
                 expected_dt = config.expected_frame_time_sec * 1.e9;
                 break;
         }
+        expected_dt=0.1;
 
         if (!is_initialized) {
             is_initialized = true;
@@ -247,9 +266,23 @@ void RegisterNewFrameCallback(const sensor_msgs::PointCloud2Ptr &pc_ptr) {
     }
 
     // -- PUBLISH RESULTS
-    publishers[ODOM_POSE].
-            publish(ct_icp::SlamPoseToROSOdometry(summary.frame.end_pose.pose, stamp)
-    );
+    auto pose_message=ct_icp::SlamPoseToROSOdometry(summary.frame.end_pose.pose, stamp);
+    publishers[ODOM_POSE].publish(pose_message);
+    geometry_msgs::PoseStamped current_pose;
+    current_pose.header = pose_message.header;
+    current_pose.pose.position.x = pose_message.pose.pose.position.x;
+    current_pose.pose.position.y = pose_message.pose.pose.position.y;
+    current_pose.pose.position.z = pose_message.pose.pose.position.z;
+    current_pose.pose.orientation.x = pose_message.pose.pose.orientation.x;
+    current_pose.pose.orientation.y = pose_message.pose.pose.orientation.y;
+    current_pose.pose.orientation.z = pose_message.pose.pose.orientation.z;
+    current_pose.pose.orientation.w = pose_message.pose.pose.orientation.w;
+
+    odom_path.header = pose_message.header;
+    odom_path.header.frame_id = "odom2";
+    odom_path.poses.push_back(current_pose);
+    publishers[ODOM_TRAJ].publish(odom_path);
+
     if (!summary.corrected_points.
             empty()
             )
@@ -261,6 +294,22 @@ void RegisterNewFrameCallback(const sensor_msgs::PointCloud2Ptr &pc_ptr) {
             )
         ct_icp::PublishPoints(publishers[KEY_POINTS], summary
                 .keypoints, ct_icp::main_frame_id, stamp);
+
+
+    auto tic = std::chrono::steady_clock::now();
+    auto pc = odometry_ptr->GetMapPointCloud();
+    auto pc_proxy = pc->XYZConst<float>();
+    pcl::PointCloud<pcl::PointXYZ> map_points;
+    map_points.header.frame_id = ct_icp::main_frame_id;
+    map_points.header.stamp = stamp.toNSec()/1000;
+    for(size_t i=0;i<pc_proxy.size();++i){
+        Eigen::Vector3f pt = pc_proxy[i];
+        map_points.push_back(pcl::PointXYZ(pt.x(),pt.y(),pt.z()));
+    }
+    publishers[MAP].publish(map_points);
+    // auto pc = odometry_ptr->GetMapPointCloud()->DeepCopy();
+    auto toc = std::chrono::steady_clock::now();
+    ROS_INFO_STREAM("publishing map takes " << std::chrono::duration_cast<std::chrono::nanoseconds>(toc-tic).count()/1000000.0);
 
     tfBroadcasterPtr->
             sendTransform(ct_icp::TransformFromPose(summary.frame.begin_pose.pose, stamp)
@@ -333,7 +382,9 @@ void InitializeNode(ros::NodeHandle &public_nh, ros::NodeHandle &nh) {
     publishers[ODOM_POSE] = public_nh.advertise<nav_msgs::Odometry>("/ct_icp/pose/odom", 5, false);
     publishers[KEY_POINTS] = ct_icp::RegisterPointCloudPublisher(public_nh, "/ct_icp/key_points", 1);
     publishers[WORLD_POINTS] = ct_icp::RegisterPointCloudPublisher(public_nh, "/ct_icp/world_points", 1);
+    publishers[ODOM_TRAJ] = public_nh.advertise<nav_msgs::Path>("/ct_icp/path", 5, false);
     publishers[LOG_MONITOR] = public_nh.advertise<slam_roscore::monitor_entry>("/monitor/entry", 200, false);
+    publishers[MAP] = public_nh.advertise<sensor_msgs::PointCloud2>("/ct_icp/map", 5, false);
 
     tfBroadcasterPtr = std::make_unique<tf2_ros::TransformBroadcaster>();
 }
@@ -347,7 +398,7 @@ int main(int argc, char **argv) {
     ros::NodeHandle public_nh;
     InitializeNode(public_nh, private_nh);
     // Add a point cloud subscriber
-    ros::Subscriber pointcloud_subscriber = public_nh.subscribe("/ct_icp/pointcloud", 200,
+    ros::Subscriber pointcloud_subscriber = public_nh.subscribe("/ct_icp/pointcloud", 9999,
                                                                 &RegisterNewFrameCallback);
     ros::spin();
     return 0;

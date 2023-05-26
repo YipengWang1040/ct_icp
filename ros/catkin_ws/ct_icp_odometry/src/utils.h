@@ -43,7 +43,7 @@ namespace ct_icp {
     }
 
     // The Frame Ids on which the published topics depend
-    const std::string main_frame_id = "odom";
+    const std::string main_frame_id = "odom2";
     const std::string child_frame_id = "base_link";
 
     typedef pcl::PointCloud<slam::XYZTPoint> CloudMessageT;
